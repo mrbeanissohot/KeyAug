@@ -1,23 +1,13 @@
 --[[
     Assault Rifle only - auto-equip an "Aug" skin (client-side, visual only)
-
-    - Only the weapon named "AssaultRifle" / "Assault Rifle" is touched
-      (case-insensitive, spaces ignored). Every other weapon uses the real game logic.
-    - Looks through CosmeticLibrary for every Skin whose name contains KEYWORD
-      and equips one automatically.
-    - Nothing is sent to the server, so only you see it.
-
-    Based on the structure of the decoded Rivals unlocker. Untested against the live
-    game: if a module path or field name changed in an update, the pcall guards will
-    print a warning instead of erroring.
+    Optimized: cached lookups, no full-game rescans, signals only on relevant instances.
 ]]
 
--- (wrapped in pcall so a failure here can never stop the Keyaug script below)
 local frontOk, frontErr = pcall(function()
 
 ---------------------------------------------------------------- config
-local KEYWORD = "aug"   -- any skin whose name contains this (case-insensitive)
-local PICK    = nil     -- optional: exact skin name to prefer, e.g. "Aug Something"
+local KEYWORD = "aug"
+local PICK    = nil
 ---------------------------------------------------------------------------
 
 local Players = game:GetService("Players")
@@ -34,25 +24,29 @@ local datCtrl = require(ctrl:WaitForChild("PlayerDataController", 10))
 
 local Cosmetics = cosLib.Cosmetics
 
----------------------------------------------------------------- helpers
-local function wepName(w)
-    if type(w) == "table" then w = w.Name end
-    return w
-end
+---------------------------------------------------------------- helpers (memoized)
+local arCache, augCache = {}, {}
 
 local function isAR(w)
-    w = wepName(w)
+    if type(w) == "table" then w = w.Name end
     if type(w) ~= "string" then return false end
-    return (w:lower():gsub("%s+", "")) == "assaultrifle"
-end
-
-local function isAugName(n)
-    return type(n) == "string" and n:lower():find(KEYWORD, 1, true) ~= nil
+    local r = arCache[w]
+    if r == nil then
+        r = (w:lower():gsub("%s+", "")) == "assaultrifle"
+        arCache[w] = r
+    end
+    return r
 end
 
 local function isAugSkin(n)
-    local c = isAugName(n) and Cosmetics[n]
-    return c and c.Type == "Skin" or false
+    if type(n) ~= "string" then return false end
+    local r = augCache[n]
+    if r == nil then
+        local c = Cosmetics[n]
+        r = (n:lower():find(KEYWORD, 1, true) ~= nil) and c ~= nil and c.Type == "Skin"
+        augCache[n] = r
+    end
+    return r
 end
 
 local function mkSkin(name)
@@ -76,7 +70,7 @@ end
 ---------------------------------------------------------------- find + pick the skin
 local matches = {}
 for name, c in pairs(Cosmetics) do
-    if type(name) == "string" and c.Type == "Skin" and isAugName(name) then
+    if type(name) == "string" and c.Type == "Skin" and name:lower():find(KEYWORD, 1, true) then
         table.insert(matches, name)
     end
 end
@@ -92,9 +86,8 @@ if PICK and isAugSkin(PICK) then chosen = PICK end
 
 local arSkin = mkSkin(chosen)
 print(("[AR-Aug] %d matching skin(s); equipping '%s'"):format(#matches, chosen))
-print("[AR-Aug] matches: " .. table.concat(matches, ", "))
 
----------------------------------------------------------------- ownership (AR + Aug skins only)
+---------------------------------------------------------------- ownership
 for _, key in ipairs({ "OwnsCosmetic", "OwnsCosmeticNormally", "OwnsCosmeticUniversally", "OwnsCosmeticForWeapon" }) do
     local orig = cosLib[key]
     if type(orig) == "function" then
@@ -105,42 +98,47 @@ for _, key in ipairs({ "OwnsCosmetic", "OwnsCosmeticNormally", "OwnsCosmeticUniv
     end
 end
 
----------------------------------------------------------------- inventory view
+---------------------------------------------------------------- inventory view (cached)
 local origGet = datCtrl.Get
+local invSrc, invProxy
+local invMeta = {
+    __index = function(_, k)
+        if isAugSkin(k) then return true end
+        return nil
+    end,
+}
 datCtrl.Get = function(self, key, ...)
     local val = origGet(self, key, ...)
     if key == "CosmeticInventory" then
+        if invProxy and invSrc == val then return invProxy end
         local prx = {}
         if val then for k, v in pairs(val) do prx[k] = v end end
-        return setmetatable(prx, {
-            __index = function(_, k)
-                if isAugSkin(k) then return true end
-                return nil
-            end,
-        })
+        invSrc, invProxy = val, setmetatable(prx, invMeta)
+        return invProxy
     end
     return val
 end
 
----------------------------------------------------------------- loadout view (AR only)
+---------------------------------------------------------------- loadout view (cached)
 local origGetWep = datCtrl.GetWeaponData
+local wepCache = {}
 datCtrl.GetWeaponData = function(self, wn, ...)
     local d = origGetWep(self, wn, ...)
     if not d then return nil end
-    if isAR(wn) and arSkin then
+    if arSkin and isAR(wn) then
+        local c = wepCache[wn]
+        if c and c.src == d and c.skin == arSkin then return c.out end
         local m = {}
         for k, v in pairs(d) do m[k] = v end
         m.Name = wn
         m.Skin = arSkin
+        wepCache[wn] = { src = d, skin = arSkin, out = m }
         return m
     end
     return d
 end
 
----------------------------------------------------------------- remotes (only swallow AR + Aug equips)
-local fightCtrl
-pcall(function() fightCtrl = require(ctrl:WaitForChild("FighterController", 10)) end)
-
+---------------------------------------------------------------- remotes
 if hookmetamethod and getnamecallmethod then
     local remotes  = RS:FindFirstChild("Remotes")
     local dataRem  = remotes and remotes:FindFirstChild("Data")
@@ -150,10 +148,9 @@ if hookmetamethod and getnamecallmethod then
         local old
         old = hookmetamethod(game, "__namecall", function(self, ...)
             if self == equipRem and getnamecallmethod() == "FireServer" then
-                local a = { ... }
-                local wn, ct, cn = a[1], a[2], a[3]
+                local wn, ct, cn = ...
                 if isAR(wn) and ct == "Skin" and isAugSkin(cn) then
-                    arSkin = mkSkin(cn)  -- user picked another Aug skin in the UI
+                    arSkin = mkSkin(cn)
                     task.defer(function()
                         pcall(function() datCtrl.CurrentData:Replicate("WeaponInventory") end)
                     end)
@@ -208,12 +205,12 @@ pcall(function()
     local vmMod = lp.PlayerScripts.Modules.ClientReplicatedClasses.ClientFighter.ClientItem:FindFirstChild("ClientViewModel")
     if not vmMod then return end
     local CVM = require(vmMod)
+    local RC = require(RS.Modules.ReplicatedClass)
     local origNew = CVM.new
     CVM.new = function(repData, cliItm, ...)
         local owner = cliItm.ClientFighter and cliItm.ClientFighter.Player
         local wn = buildingWep or cliItm.Name
-        if owner == lp and isAR(wn) and arSkin then
-            local RC = require(RS.Modules.ReplicatedClass)
+        if owner == lp and arSkin and isAR(wn) then
             local dk = RC:ToEnum("Data")
             repData[dk] = repData[dk] or {}
             repData[dk][RC:ToEnum("Skin")] = arSkin
@@ -253,39 +250,34 @@ local CONFIG = [==[
 ]==]
 
 local CDN_FOLDER = "AWildcat/keyaug"
-local MESH_METHOD = "both"  -- "both", "direct" or "apply" (try another if meshes don't show)
-local CONVERT_OBJ = true    -- true = turn downloaded .obj into Roblox .mesh
-local REFRESH = false       -- true = delete cached downloads and download everything again
+local MESH_METHOD = "both"
+local CONVERT_OBJ = true
+local REFRESH = false
 
--- size multipliers (used by the "scale" field in the rules)
+-- performance: false = only watch matched instances + camera/PlayerGui/nil.
+-- set true if something stops swapping (slower).
+local WATCH_ALL = false
+local NIL_SCAN_INTERVAL = 10
+
 local SCALES = {
-	aug = 1.2,  -- Keyaug body
-	mag = 0.7,  -- Keyaug magazine
+	aug = 1.2,
+	mag = 0.7,
 }
 
--- true  = weapon icons use the generated textures
--- false = weapon icons use the original GitHub pngs
 local ICONS_USE_TEXTURES = false
-
--- texture version: change it to force the generated textures to be rebuilt
 local TEXTURE_VERSION = "v2"
 
--- ===== KEY SKIN COLORS (edit these to match the skin exactly) =====
-local KEY_BASE   = { 255, 196, 40 }  -- main key color (gold)
-local KEY_DARK   = { 150, 100, 10 }  -- darker stripe / shading
-local KEY_EDGE   = { 255, 240, 170 } -- bright border highlight
+local KEY_BASE   = { 255, 196, 40 }
+local KEY_DARK   = { 150, 100, 10 }
+local KEY_EDGE   = { 255, 240, 170 }
 
--- ===== TRAIL SETTINGS =====
 local TRAIL_COLOR_A = Color3.fromRGB(255, 196, 40)
 local TRAIL_COLOR_B = Color3.fromRGB(255, 240, 170)
 local TRAIL_LIFETIME = 0.3
 local TRAIL_WIDTH = 0.06
 
 
----
-
 -- environment check
-
 local missing = {}
 for _, p in ipairs({
 	{ "isfile", isfile }, { "writefile", writefile },
@@ -307,10 +299,7 @@ if REFRESH and listfiles and delfile then
 end
 
 
----
-
 -- download + convert
-
 local function hashStr(s)
 	local h = 5381
 	for i = 1, #s do h = (h * 33 + s:byte(i)) % 4294967296 end
@@ -432,7 +421,6 @@ loadCdnInner = function(url)
 			failedList[#failedList + 1] = name .. " (download failed)"
 			return nil
 		end
-		-- GitHub returns a tiny "404: Not Found" text for bad links
 		if #data < 200 and data:find("404") then
 			stats.failed += 1
 			failedList[#failedList + 1] = name .. " (404 not found)"
@@ -470,10 +458,7 @@ loadCdnInner = function(url)
 end
 
 
----
-
--- custom texture generator (builds real PNG files, no downloads needed)
-
+-- custom texture generator
 local crcTable = {}
 for i = 0, 255 do
 	local c = i
@@ -520,7 +505,6 @@ local function makePng(w, h, pixel)
 	end
 	local raw = table.concat(rows)
 
-	-- zlib stream made of "stored" (uncompressed) deflate blocks
 	local blocks = { "\120\1" }
 	local pos = 1
 	while pos <= #raw do
@@ -545,7 +529,6 @@ local WHITE = { 245, 245, 245 }
 local BLACK = { 0, 0, 0 }
 
 local TEXTURES = {
-	-- assault rifle: white + red diagonal stripes with a red edge
 	ar = function(x, y)
 		local c
 		if x < 8 or y < 8 or x >= 248 or y >= 248 then
@@ -557,17 +540,14 @@ local TEXTURES = {
 		end
 		return c[1], c[2], c[3]
 	end,
-	-- sniper: black with white stripes
 	sniper = function(x, y)
 		local c = BLACK
 		if (x - y) % 64 < 14 then c = WHITE end
 		return c[1], c[2], c[3]
 	end,
-	-- daggers: plain black
 	dagger = function()
 		return 0, 0, 0
 	end,
-	-- key skin: gold base, soft darker diagonal bands, bright edge highlight
 	key = function(x, y)
 		local c = KEY_BASE
 		if x < 6 or y < 6 or x >= 250 or y >= 250 then
@@ -609,12 +589,10 @@ local function texAsset(key)
 end
 
 
----
-
 -- rules
-
 local HttpService = game:GetService("HttpService")
 local AssetService = game:GetService("AssetService")
+local Players = game:GetService("Players")
 local rules = HttpService:JSONDecode(CONFIG).replacement_rules
 local lookup, meshCache = {}, {}
 local registered, swapped = 0, 0
@@ -647,7 +625,6 @@ local function flatten(list, out)
 	return out
 end
 
--- resolve (download / convert) EVERY rule at the same time
 local active = flatten(rules, {})
 local targets = {}
 local pendingCount = #active
@@ -660,7 +637,6 @@ for i, rule in ipairs(active) do
 end
 while pendingCount > 0 do task.wait() end
 
--- register in the original rule order so overlapping ids behave the same
 local meshAssets = {}
 for i, rule in ipairs(active) do
 	local target = targets[i]
@@ -683,7 +659,6 @@ for i, rule in ipairs(active) do
 	end
 end
 
--- pre-load every replacement mesh at once so all weapons swap instantly
 if MESH_METHOD ~= "direct" then
 	local warming = 0
 	for asset in pairs(meshAssets) do
@@ -704,10 +679,7 @@ print(("[Keyaug] rules ready: %d | cached: %d | downloaded: %d | failed: %d"):fo
 for _, f in ipairs(failedList) do warn("[Keyaug] FAILED: " .. f) end
 
 
----
-
 -- apply to the game
-
 local PROPS = {
 	MeshPart = { "MeshId", "TextureID" },
 	SpecialMesh = { "MeshId", "TextureId" },
@@ -720,9 +692,10 @@ local PROPS = {
 }
 
 local seen = setmetatable({}, { __mode = "k" })
-local forcedTexture = setmetatable({}, { __mode = "k" }) -- inst -> custom texture asset
-local scaleState = setmetatable({}, { __mode = "k" })    -- inst -> target size/scale (false = pending)
-local trailed = setmetatable({}, { __mode = "k" })       -- inst -> true once a trail is attached
+local seenNil = setmetatable({}, { __mode = "k" })
+local forcedTexture = setmetatable({}, { __mode = "k" })
+local scaleState = setmetatable({}, { __mode = "k" })
+local trailed = setmetatable({}, { __mode = "k" })
 
 local function hideMesh(inst)
 	pcall(function()
@@ -734,7 +707,6 @@ local function hideMesh(inst)
 	end)
 end
 
--- adds a colored trail that follows the weapon
 local function addTrail(inst)
 	if trailed[inst] then return end
 	local part = inst
@@ -810,15 +782,12 @@ local function applyScale(inst, factor)
 	if not factor or factor == 1 then return end
 	local st = scaleState[inst]
 	if st ~= nil then
-		-- already scaled (or pending): just re-assert the size after a mesh swap
-		if st then
-			task.defer(setTarget, inst, st)
-		end
+		if st then task.defer(setTarget, inst, st) end
 		return
 	end
 	scaleState[inst] = false
 	task.spawn(function()
-		task.wait(0.1) -- let the new mesh settle so we multiply its real size
+		task.wait(0.1)
 		local target
 		pcall(function()
 			if inst:IsA("MeshPart") then
@@ -840,22 +809,23 @@ local function setTexture(inst, asset)
 	pcall(function() inst[prop] = asset end)
 end
 
+-- returns true if this instance matched a rule (so it's worth watching)
 local function handle(inst, p)
 	local ok, cur = pcall(function() return inst[p] end)
-	if not ok then return end
+	if not ok then return false end
 
-	-- keep our custom texture if the game tries to change it back
 	local forced = forcedTexture[inst]
 	if forced and (p == "TextureID" or p == "TextureId") then
 		if cur ~= forced then
 			pcall(function() inst[p] = forced end)
 		end
-		return
+		return true
 	end
 
+	if cur == "" or cur == nil then return false end
 	local id = parseId(cur)
 	local entry = id and lookup[id]
-	if entry == nil then return end
+	if entry == nil then return false end
 	local new = entry.target
 
 	swapped += 1
@@ -875,19 +845,35 @@ local function handle(inst, p)
 	else
 		pcall(function() inst[p] = new end)
 	end
+	return true
+end
+
+local camera = workspace.CurrentCamera
+local playerGui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
+
+-- only these places get signals on non-matching instances
+local function shouldWatch(inst)
+	if WATCH_ALL then return true end
+	if not inst:IsDescendantOf(game) then return true end -- nil-parented (cached viewmodels)
+	if camera and inst:IsDescendantOf(camera) then return true end
+	if playerGui and inst:IsDescendantOf(playerGui) then return true end
+	return false
 end
 
 local function apply(inst)
 	local props = PROPS[inst.ClassName]
 	if not props or seen[inst] then return end
 	seen[inst] = true
+	local watching = shouldWatch(inst)
 	for _, p in ipairs(props) do
-		task.spawn(handle, inst, p)
-		pcall(function()
-			inst:GetPropertyChangedSignal(p):Connect(function()
-				handle(inst, p)
+		local matched = handle(inst, p)
+		if matched or watching then
+			pcall(function()
+				inst:GetPropertyChangedSignal(p):Connect(function()
+					handle(inst, p)
+				end)
 			end)
-		end)
+		end
 	end
 end
 
@@ -900,12 +886,16 @@ local function scan()
 	end
 end
 
+-- nil instances: each one (and its descendants) is processed only once
 local function scanNil()
 	if type(getnilinstances) ~= "function" then return end
 	pcall(function()
 		for _, d in ipairs(getnilinstances()) do
-			apply(d)
-			for _, c in ipairs(d:GetDescendants()) do apply(c) end
+			if not seenNil[d] then
+				seenNil[d] = true
+				apply(d)
+				for _, c in ipairs(d:GetDescendants()) do apply(c) end
+			end
 		end
 	end)
 end
@@ -914,14 +904,12 @@ game.DescendantAdded:Connect(apply)
 scan()
 scanNil()
 
--- catch parts that load late
+-- DescendantAdded handles late loads; only nil storage needs a slow poll
 task.spawn(function()
 	while true do
-		task.wait(2)
-		scan()
+		task.wait(NIL_SCAN_INTERVAL)
 		scanNil()
 	end
 end)
 
 print("[Keyaug] loaded")
-
