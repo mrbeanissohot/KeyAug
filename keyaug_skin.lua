@@ -234,7 +234,7 @@ if not frontOk then warn("[AR-Aug] front block failed: " .. tostring(frontErr)) 
 local CONFIG = [==[
 {
 "replacement_rules": [
-{ "name": "Body", "replace_ids": [18687757654], "mode": "cdn", "enabled": true, "cdn_url": "https://raw.githubusercontent.com/boxyghosly/RivalsSkinChanger/refs/heads/main/KeyaugBody9.obj", "scale": "aug", "texture": "key", "trail": true },
+{ "name": "Body", "replace_ids": [18687757654], "mode": "cdn", "enabled": true, "cdn_url": "https://raw.githubusercontent.com/boxyghosly/RivalsSkinChanger/refs/heads/main/KeyaugBody9.obj", "scale": "aug", "texture": "key" },
 { "name": "Remove", "replace_ids": [18687757291, 18687757011, 18687756555, 18687757157], "mode": "id", "enabled": true },
 { "name": "shootingsound", "replace_ids": [17662574783], "mode": "cdn", "enabled": true, "cdn_url": "https://raw.githubusercontent.com/boxyghosly/RivalsSkinChanger/main/kaug.mp3" },
 { "name": "Removeshootsound", "replace_ids": [18764343961], "mode": "id", "enabled": true },
@@ -270,11 +270,6 @@ local TEXTURE_VERSION = "v2"
 local KEY_BASE   = { 255, 196, 40 }
 local KEY_DARK   = { 150, 100, 10 }
 local KEY_EDGE   = { 255, 240, 170 }
-
-local TRAIL_COLOR_A = Color3.fromRGB(255, 196, 40)
-local TRAIL_COLOR_B = Color3.fromRGB(255, 240, 170)
-local TRAIL_LIFETIME = 0.3
-local TRAIL_WIDTH = 0.06
 
 
 -- environment check
@@ -643,7 +638,7 @@ for i, rule in ipairs(active) do
 	if target ~= nil then
 		registered += 1
 
-		local entry = { target = target, trail = rule.trail }
+		local entry = { target = target }
 		if rule.scale then entry.scale = SCALES[rule.scale] end
 		if rule.texture and rule.mode ~= "texture" then
 			entry.texture = texAsset(rule.texture)
@@ -695,7 +690,6 @@ local seen = setmetatable({}, { __mode = "k" })
 local seenNil = setmetatable({}, { __mode = "k" })
 local forcedTexture = setmetatable({}, { __mode = "k" })
 local scaleState = setmetatable({}, { __mode = "k" })
-local trailed = setmetatable({}, { __mode = "k" })
 
 local function hideMesh(inst)
 	pcall(function()
@@ -704,46 +698,6 @@ local function hideMesh(inst)
 		elseif inst:IsA("SpecialMesh") then
 			inst.Scale = Vector3.new(0, 0, 0)
 		end
-	end)
-end
-
-local function addTrail(inst)
-	if trailed[inst] then return end
-	local part = inst
-	if inst:IsA("SpecialMesh") then part = inst.Parent end
-	if not part or not part:IsA("BasePart") then return end
-	trailed[inst] = true
-
-	pcall(function()
-		local a0 = Instance.new("Attachment")
-		a0.Name = "KeyTrailA"
-		a0.Position = Vector3.new(0, TRAIL_WIDTH, 0)
-		a0.Parent = part
-
-		local a1 = Instance.new("Attachment")
-		a1.Name = "KeyTrailB"
-		a1.Position = Vector3.new(0, -TRAIL_WIDTH, 0)
-		a1.Parent = part
-
-		local trail = Instance.new("Trail")
-		trail.Name = "KeyTrail"
-		trail.Attachment0 = a0
-		trail.Attachment1 = a1
-		trail.Lifetime = TRAIL_LIFETIME
-		trail.MinLength = 0.05
-		trail.FaceCamera = true
-		trail.LightEmission = 0.8
-		trail.LightInfluence = 0
-		trail.Color = ColorSequence.new(TRAIL_COLOR_A, TRAIL_COLOR_B)
-		trail.Transparency = NumberSequence.new({
-			NumberSequenceKeypoint.new(0, 0.1),
-			NumberSequenceKeypoint.new(1, 1),
-		})
-		trail.WidthScale = NumberSequence.new({
-			NumberSequenceKeypoint.new(0, 1),
-			NumberSequenceKeypoint.new(1, 0),
-		})
-		trail.Parent = part
 	end)
 end
 
@@ -840,7 +794,6 @@ local function handle(inst, p)
 			applyMesh(inst, new)
 			if entry.texture then setTexture(inst, entry.texture) end
 			applyScale(inst, entry.scale)
-			if entry.trail then addTrail(inst) end
 		end
 	else
 		pcall(function() inst[p] = new end)
